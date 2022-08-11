@@ -1,0 +1,338 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  Remediation:
+    Type: String
+    Default: True
+    AllowedValues:
+      - True
+      - False
+Resources:
+  EvaluateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+  EvaluateLambdaRolePolicy:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: "ELBv2 permissions are read/list only, must be able to check any ELBv2.  PutEvaluation does not support resources other than *"
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - "xray:PutTraceSegments"
+              - "xray:PutTelemetryRecords"
+              - "elasticloadbalancing:DescribeLoadBalancers"
+              - "config:PutEvaluations"
+            Resource: "*"
+      Roles:
+        - !Ref EvaluateLambdaRole
+  RemediateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Tags:
+        - Key: RoleType
+          Value: RestrictedConfigRemediationRole
+  RemediateLambdaRolePolicy:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: "ELBv2 permissions are read/list only, must be able to check any ELBv2.  PutEvaluation does not support resources other than *"
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - "xray:PutTraceSegments"
+              - "xray:PutTelemetryRecords"
+              - "elasticloadbalancing:AddTags"
+              - "elasticloadbalancing:RemoveTags"
+              - "elasticloadbalancing:DescribeLoadBalancers"
+              - "config:PutEvaluations"
+            Resource: "*"
+      Roles:
+        - !Ref RemediateLambdaRole
+  ConfigPermissionToCallLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ConfigRuleLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "config.amazonaws.com"
+      SourceAccount: !Ref "AWS::AccountId"
+  ConfigRuleLambdaFunction:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Permissions granted inline, CFN_nag is checking for assigned policy which is not best practice"
+          - id: W89
+            reason: "Not appropiate for use case"
+          - id: W92
+            reason: "Not relevant for use case"
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import botocore
+          from datetime import datetime
+          config_client = boto3.client('config')
+          elbv2_client = boto3.client('elbv2')
+          def determine_elbv2_tag_value(resourceArn):
+              try:
+                  response = elbv2_client.describe_load_balancers(
+                          LoadBalancerArns=[
+                          resourceArn
+                          ]
+                      )['LoadBalancers'][0]
+                  elbScheme = response['Scheme']
+                  return (elbScheme)
+              except botocore.exceptions.ClientError as error:
+                  return (error.response['Error']['Code'])
+
+          def send_eval(resourceType, resourceId, configResult, annotation, resultToken):
+              config_client.put_evaluations(
+                      Evaluations=[
+                          {
+                              'ComplianceResourceType': resourceType,
+                              'ComplianceResourceId': resourceId,
+                              'ComplianceType': configResult,
+                              'Annotation': annotation,
+                              'OrderingTimestamp': datetime.now()
+                          },
+                      ],
+                      ResultToken=resultToken
+                  )
+          def lambda_handler(event, context):
+              print (json.dumps(event))
+              annotation = ' '
+              invokingEvent = json.loads(event['invokingEvent'])
+              resourceType = invokingEvent['configurationItem']['resourceType']
+              resourceId = invokingEvent['configurationItem']['resourceId']
+              resultToken = event['resultToken']
+              if invokingEvent['configurationItem']['configurationItemStatus'] == 'ResourceDeleted':
+                  configResult = 'COMPLIANT'
+              else:
+                  configResult = 'NON_COMPLIANT'
+                  loadBalancerArn = invokingEvent['configurationItem']['configuration']['loadBalancerArn']
+                  elbScheme = determine_elbv2_tag_value(loadBalancerArn)
+                  if not elbScheme in ['internet-facing','internal']:
+                      annotation = " There was an error: " + elbScheme
+                      send_eval(resourceType, resourceId,'NON_COMPLIANT', annotation, resultToken)
+                  tags = invokingEvent['configurationItem']['supplementaryConfiguration']['Tags']
+                  for tag in tags:
+                      if tag['key'] == 'elbv2Scheme':
+                          print ("FOund Tag")
+                          print ("tag['value']")
+                          print (tag['value'])
+                          print (elbScheme)
+                          print (elbScheme == tag['value'])
+                          if tag['value'] == elbScheme:
+                              configResult = 'COMPLIANT'
+                          else:
+                              if tag['value'] in ['internet-facing','internal']:
+                                  annotation = "elbv2Scheme tag has inaccurate value: " + tag['value']
+                              else:
+                                  configResult = 'NON_COMPLIANT'
+                                  annotation = "elbv2Scheme tag has invalid value: " + tag['value']
+                          break
+                  send_eval(resourceType, resourceId, configResult, annotation, resultToken)
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      TracingConfig:
+        Mode: Active
+      Timeout: 30
+      Role: !GetAtt EvaluateLambdaRole.Arn
+  RemediateLambdaFunction:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Permissions granted inline, CFN_nag is checking for assigned policy which is not best practice"
+          - id: W89
+            reason: "Not appropiate for use case"
+          - id: W92
+            reason: "Not relevant for use case"
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Role:
+        Fn::GetAtt:
+          - RemediateLambdaRole
+          - Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          elbv2_client = boto3.client('elbv2')
+          def determine_elbv2_tag_value(resourceArn):
+              try:
+                  response = elbv2_client.describe_load_balancers(
+                      LoadBalancerArns=[
+                      resourceArn
+                      ]
+                      )['LoadBalancers'][0]
+                  elbScheme = response['Scheme']
+                  return (elbScheme)
+              except botocore.exceptions.ClientError as error:
+                  return (error.response['Error']['Code'])
+
+          def lambda_handler(resourceArn, context):
+              print (resourceArn)
+              response = elbv2_client.describe_load_balancers(
+                  LoadBalancerArns=[
+                      resourceArn
+                      ]
+              )['LoadBalancers'][0]
+              elbScheme = response['Scheme']
+              elbv2_client.add_tags(
+                  ResourceArns=[
+                      resourceArn,
+                  ],
+                  Tags=[
+                      {
+                          'Key': 'elbv2Scheme',
+                          'Value': elbScheme
+                      }
+                  ]
+              )
+  ConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::ElasticLoadBalancingV2::LoadBalancer"
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails:
+          -
+            EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+          -
+            EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+        SourceIdentifier: !GetAtt ConfigRuleLambdaFunction.Arn
+    DependsOn: ConfigPermissionToCallLambda
+  SSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        description: Set the Tag elbv2Scheme equal to the associate resource CP scheme value
+        schemaVersion: '0.3'
+        assumeRole: !GetAtt SSMRole.Arn
+        parameters:
+          ResourceArn:
+            type: String
+            allowedPattern: ^(arn:(?:aws|aws-cn|aws-us-gov):[\w\d-]+:[\w\d-]*:\d{0,12}:[\w\d-]*\/?[\w\d-]*)(\/.*)?.*$
+          AutomationAssumeRole:
+            type: String
+            default: ''
+        mainSteps:
+          - name: proactive_engagement_health_checks_cloudfront
+            action: 'aws:invokeLambdaFunction'
+            inputs:
+              InvocationType: Event
+              FunctionName: !Ref RemediateLambdaFunction
+              Payload: '"{{ ResourceArn }}"'
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ssm.amazonaws.com
+              - config.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Path: /
+  SSMRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - "lambda:InvokeFunction"
+            Resource:
+              - !GetAtt RemediateLambdaFunction.Arn
+      Roles:
+        - !Ref SSMRole
+  ConfigRuleRemediationConfiguration:
+      Type: "AWS::Config::RemediationConfiguration"
+      Properties:
+        Automatic: !Ref Remediation
+        ConfigRuleName: !Ref ConfigRule
+        MaximumAutomaticAttempts: 5
+        RetryAttemptSeconds: 15
+        Parameters:
+          ResourceArn:
+            ResourceValue:
+              Value: RESOURCE_ID
+          AutomationAssumeRole:
+            StaticValue:
+              Values:
+                - !GetAtt SSMRole.Arn
+        TargetId: !Ref SSMDocument
+        TargetType: "SSM_DOCUMENT"
+        TargetVersion: "1"
